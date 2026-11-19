@@ -1497,6 +1497,23 @@ class TestSpyreOpParsers(ParseTestMixin):
         self.assert_attribute(op, "beta", 0.2, transform=lambda v: round(v, 2))
         self.assert_attribute(op, "threshold", 0.1, transform=lambda v: round(v, 2))
 
+    @pytest.mark.parametrize("operand_name", ["%x_beta", "%beta_in"])
+    def test_softplus_operand_name_contains_beta(self, operand_name):
+        # F6 regression: the operand text must be sliced on the `beta`
+        # *keyword*, not on the first "beta" substring anywhere in the op
+        # text -- which would otherwise truncate an SSA name like %x_beta
+        # down to %x_, or make %beta_in disappear entirely.
+        op = self._parse(
+            f"%y = spyreop.softplus {operand_name} beta 2.000000e-01 "
+            "threshold 1.000000e-01 : f16",
+            args={operand_name: "f16"},
+        )
+        self.assert_op_type(op, "spyreop.softplus")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, operand_name)
+        self.assert_attribute(op, "beta", 0.2, transform=lambda v: round(v, 2))
+        self.assert_attribute(op, "threshold", 0.1, transform=lambda v: round(v, 2))
+
     def test_layernormscale(self):
         op = self._parse(
             "%y = spyreop.layernormscale %mean squares %msq : f16",

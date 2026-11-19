@@ -37,6 +37,8 @@ not a hardware constraint: the real ``.smc`` templates select FP16 or
 FP32 arithmetic externally, and compute in FP16 when given FP16 inputs.
 """
 
+import operator
+
 import numpy as np
 
 from ..ir_types import Tile
@@ -66,7 +68,9 @@ class SpyreOps:
         decides what gets cast back.
         """
         def _gelu(x):
-            xf = x.astype(np.float32)
+            # np.asarray (not x.astype) so a plain Python float scalar --
+            # which has no .astype -- works too, not just Tile data.
+            xf = np.asarray(x, dtype=np.float32)
             inner = np.float32(0.7978845608028654) * (
                 xf + np.float32(0.044715) * xf * xf * xf)
             return np.float32(0.5) * xf * (np.float32(1.0) + np.tanh(inner))
@@ -77,7 +81,7 @@ class SpyreOps:
     def silu(val):
         """SiLU / Swish: ``x * sigmoid(x)``."""
         def _silu(x):
-            xf = x.astype(np.float32)
+            xf = np.asarray(x, dtype=np.float32)
             sig = np.float32(1.0) / (np.float32(1.0) + np.exp(-xf))
             return xf * sig
 
@@ -93,7 +97,9 @@ class SpyreOps:
         interpreter models the intrinsic's *result*, not its
         approximation error).
         """
-        return tile_unary_float(lambda x: np.float32(1.0) / x.astype(np.float32), val)
+        return tile_unary_float(
+            lambda x: np.float32(1.0) / np.asarray(x, dtype=np.float32), val
+        )
 
     # ------------------------------------------------------------------
     # Softplus (one operand, two compile-time F32 attributes)
@@ -112,7 +118,7 @@ class SpyreOps:
         threshold = np.float32(threshold)
 
         def _softplus(x):
-            xf = x.astype(np.float32)
+            xf = np.asarray(x, dtype=np.float32)
             bx = beta * xf
             above = bx > threshold
             # Clip before exp: a lane already routed to the identity branch
@@ -138,17 +144,17 @@ class SpyreOps:
         them, which is exactly 32-bit modular addition (confirmed against
         ``addi32toi32.smc``'s halfword-carry construction).
         """
-        return SpyreOps._int_add(lhs, rhs, np.int32)
+        return SpyreOps._int_binop(operator.add, lhs, rhs, np.int32)
 
     @staticmethod
     def addi64toi64(lhs, rhs):
         """64-bit integer add, address-arithmetic entry point."""
-        return SpyreOps._int_add(lhs, rhs, np.int64)
+        return SpyreOps._int_binop(operator.add, lhs, rhs, np.int64)
 
     @staticmethod
     def muli32toi32(lhs, rhs):
         """32-bit integer multiply, address-arithmetic entry point."""
-        return SpyreOps._int_mul(lhs, rhs, np.int32)
+        return SpyreOps._int_binop(operator.mul, lhs, rhs, np.int32)
 
     @staticmethod
     def idx32toaddr(index, base, stride):
@@ -171,24 +177,18 @@ class SpyreOps:
         return int(_compute(np.int32(index), np.int32(base), np.int32(stride)))
 
     @staticmethod
-    def _int_add(lhs, rhs, np_dtype):
+    def _int_binop(op, lhs, rhs, np_dtype):
+        """Shared ``+``/``*`` dispatch for ``addi32toi32``/``addi64toi64``/
+        ``muli32toi32``: casts both operands to ``np_dtype`` before and
+        after applying ``op``, for wraparound at that exact width.
+        """
         if isinstance(lhs, Tile) or isinstance(rhs, Tile):
             a = lhs.data if isinstance(lhs, Tile) else np_dtype(lhs)
             b = rhs.data if isinstance(rhs, Tile) else np_dtype(rhs)
             dtype = lhs.dtype if isinstance(lhs, Tile) else rhs.dtype
             shape = lhs.shape if isinstance(lhs, Tile) else rhs.shape
-            return Tile((a.astype(np_dtype) + b.astype(np_dtype)).astype(np_dtype), dtype, shape)
-        return int(np_dtype(np_dtype(lhs) + np_dtype(rhs)))
-
-    @staticmethod
-    def _int_mul(lhs, rhs, np_dtype):
-        if isinstance(lhs, Tile) or isinstance(rhs, Tile):
-            a = lhs.data if isinstance(lhs, Tile) else np_dtype(lhs)
-            b = rhs.data if isinstance(rhs, Tile) else np_dtype(rhs)
-            dtype = lhs.dtype if isinstance(lhs, Tile) else rhs.dtype
-            shape = lhs.shape if isinstance(lhs, Tile) else rhs.shape
-            return Tile((a.astype(np_dtype) * b.astype(np_dtype)).astype(np_dtype), dtype, shape)
-        return int(np_dtype(np_dtype(lhs) * np_dtype(rhs)))
+            return Tile(op(a.astype(np_dtype), b.astype(np_dtype)).astype(np_dtype), dtype, shape)
+        return int(np_dtype(op(np_dtype(lhs), np_dtype(rhs))))
 
     # ------------------------------------------------------------------
     # LayerNorm's three stages (exx2, layernormscale, layernormnorm) --

@@ -880,12 +880,26 @@ class TestSpyreOp:
         # gelu(1.0) ~= 0.8413
         assert abs(float(result) - 0.8413) < 0.01
 
+    def test_gelu_scalar_plain_python_float(self):
+        # G5: a plain Python float has no .astype -- unlike np.float16/
+        # np.float32 scalars, which test_gelu_scalar already covers --
+        # so the helper must go through np.asarray instead.
+        ctx = _ctx_with(**{"%x": 1.0})
+        result = _call("spyreop.gelu", ctx, _make_env(), operands=["%x"])
+        assert abs(float(result) - 0.8413) < 0.01
+
     def test_silu_tile(self):
         x = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
         ctx = _ctx_with(**{"%x": _tile(x)})
         result = _call("spyreop.silu", ctx, _make_env(), operands=["%x"])
         expected = x * (1.0 / (1.0 + np.exp(-x)))
         assert np.allclose(result.data, expected.astype(np.float16), rtol=1e-2, atol=1e-3)
+
+    def test_silu_scalar_plain_python_float(self):
+        ctx = _ctx_with(**{"%x": 2.0})
+        result = _call("spyreop.silu", ctx, _make_env(), operands=["%x"])
+        expected = 2.0 * (1.0 / (1.0 + np.exp(-2.0)))
+        assert abs(float(result) - expected) < 1e-2
 
     def test_reciprocal_tile(self):
         ctx = _ctx_with(**{"%x": _tile([1.0, 2.0, 4.0])})
@@ -895,6 +909,11 @@ class TestSpyreOp:
     def test_reciprocal_scalar(self):
         ctx = _ctx_with(**{"%x": np.float16(4.0)})
         assert abs(float(_call("spyreop.reciprocal", ctx, _make_env(), operands=["%x"])) - 0.25) < 1e-3
+
+    def test_reciprocal_scalar_plain_python_float(self):
+        ctx = _ctx_with(**{"%x": 4.0})
+        result = _call("spyreop.reciprocal", ctx, _make_env(), operands=["%x"])
+        assert abs(float(result) - 0.25) < 1e-3
 
     def test_softplus_tile_below_threshold(self):
         x = np.array([0.0, 1.0, -1.0], dtype=np.float32)
@@ -917,6 +936,16 @@ class TestSpyreOp:
             attributes={"beta": beta, "threshold": threshold},
         )
         assert np.allclose(result.data, x.astype(np.float16), rtol=1e-3)
+
+    def test_softplus_scalar_plain_python_float(self):
+        beta, threshold = 1.0, 20.0
+        ctx = _ctx_with(**{"%x": 1.0})
+        result = _call(
+            "spyreop.softplus", ctx, _make_env(), operands=["%x"],
+            attributes={"beta": beta, "threshold": threshold},
+        )
+        expected = (1.0 / beta) * np.log1p(np.exp(beta * 1.0))
+        assert abs(float(result) - expected) < 1e-3
 
     def test_addi32toi32_tile(self):
         a = Tile(np.array([1, 2, 3], dtype=np.int32), "i32", (3,))
@@ -1060,6 +1089,66 @@ class TestSpyreOp:
         expected_msq = (x_data * x_data).mean(axis=1)
         assert np.allclose(mean_result.data, expected_mean.astype(np.float16), rtol=1e-2, atol=1e-2)
         assert np.allclose(msq_result.data, expected_msq.astype(np.float16), rtol=1e-2, atol=1e-2)
+
+    def test_exx2_outside_linalg_generic_raises_descriptive_error(self):
+        # F3/G4: without an enclosing linalg.generic, __linalg_reduction_dims__
+        # is never set in context, so this must raise a descriptive error
+        # instead of a bare KeyError naming the internal context variable.
+        ctx = _ctx_with(**{"%in": _tile([1.0, 2.0, 3.0])})
+        with pytest.raises(
+            ValueError, match=r"spyreop\.exx2: must be used inside a linalg\.generic"
+        ):
+            _call("spyreop.exx2", ctx, _make_env(), operands=["%in"])
+
+    def test_exx2_two_reduction_dims_raises(self):
+        # G4: a generic with two reduction dims exercises spyreop__exx2's
+        # own `len(reduction_dims) != 1` guard, previously untested.
+        M, N, K = 2, 3, 4
+        x_data = np.ones((M, N, K), dtype=np.float32)
+        x_tile = Tile(x_data, "f16", (M, N, K))
+        mean_init = Tile(np.zeros((M,), dtype=np.float32), "f16", (M,))
+        sq_init = Tile(np.zeros((M,), dtype=np.float32), "f16", (M,))
+
+        ctx = _ctx_with(**{"%x": x_tile, "%mean_init": mean_init, "%sq_init": sq_init})
+        env = _make_env()
+
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    if isinstance(region_op.result, list) and isinstance(result, tuple):
+                        for name, val in zip(region_op.result, result):
+                            context.set_value(name, val)
+                    else:
+                        context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("spyreop.exx2", operands=["%in"], result=["%r0", "%r1"]),
+            _op("linalg.yield", operands=["%r0", "%r1"]),
+        ]
+        op = _op(
+            "linalg.generic",
+            operands=["%x", "%mean_init", "%sq_init"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d0)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in", "%acc0", "%acc1"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        with pytest.raises(ValueError, match=r"expected exactly one reduction dim"):
+            dispatch("linalg.generic")(op, ctx, env)
 
 
 # ---------------------------------------------------------------------------
@@ -1653,6 +1742,57 @@ class TestLinalg:
         expected = in_data.sum(axis=1) + out_data
         assert result.shape == (M,)
         assert np.allclose(result.data, expected, rtol=1e-5)
+
+    def test_generic_reduction_body_neither_combiner_nor_self_reducing(self):
+        # A reduction body that never reads its outs accumulator and isn't
+        # one of _SELF_REDUCING_OPS (e.g. spyreop.exx2) must not be routed
+        # to _whole_body_reduce -- that path has no shape-checking semantics
+        # of its own and would otherwise silently return an unreduced,
+        # wrong-shaped tile (see review F2). It should instead fall through
+        # to the classic combiner path and raise its usual diagnostic.
+        M, N = 4, 8
+        in_data = np.arange(M * N, dtype=np.float32).reshape(M, N)
+        out_data = np.zeros((M,), dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", (M, N))
+        out_tile = Tile(out_data, "f32", (M,))
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        # Body never references %oo (the outs block arg) at all.
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%ii"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        with pytest.raises(ValueError, match="cannot identify combiner op for reduction"):
+            dispatch("linalg.generic")(op, ctx, env)
 
     @pytest.mark.parametrize(
         "combiner,np_dtype,reduce_fn",

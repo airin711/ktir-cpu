@@ -295,6 +295,101 @@ def test_bundled_lhs_for_exec():
 
 
 # ---------------------------------------------------------------------------
+# 6. spyreop.exx2 through the real interpreter (G3)
+# ---------------------------------------------------------------------------
+
+# LayerNorm stage 0 over a (4, 8) tile, reduced along axis 1: a real
+# ktdp.construct_memory_view/construct_access_tile/load/store pipeline
+# around a linalg.generic whose body is exx2's whole-body reduction (see
+# dialects/linalg_ops.py's _whole_body_reduce). Unlike
+# test_exx2_via_linalg_generic in test_dialects_exec.py (which calls the
+# dispatcher directly with a hand-rolled execute_region), this goes through
+# the real interpreter._execute_op path, so it also exercises LX charging
+# and latency accounting for spyreop.exx2.
+_EXX2_MLIR = """
+module {
+  func.func @exx2_kernel(%x_ptr: index, %mean_ptr: index, %msq_ptr: index)
+      attributes {grid = [1, 1, 1]} {
+    %x_view = ktdp.construct_memory_view %x_ptr, sizes: [4, 8], strides: [8, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+      memory_space = #ktdp.memory_space<global>
+    } : memref<4x8xf16>
+
+    %mean_view = ktdp.construct_memory_view %mean_ptr, sizes: [4], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>,
+      memory_space = #ktdp.memory_space<global>
+    } : memref<4xf16>
+
+    %msq_view = ktdp.construct_memory_view %msq_ptr, sizes: [4], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>,
+      memory_space = #ktdp.memory_space<global>
+    } : memref<4xf16>
+
+    %c0 = arith.constant 0 : index
+
+    %x_tile = ktdp.construct_access_tile %x_view[%c0, %c0] {
+      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+    } : memref<4x8xf16> -> !ktdp.access_tile<4x8xindex>
+
+    %x = ktdp.load %x_tile : !ktdp.access_tile<4x8xindex> -> tensor<4x8xf16>
+
+    %mean_tile = ktdp.construct_access_tile %mean_view[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>,
+      access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<4xf16> -> !ktdp.access_tile<4xindex>
+
+    %mean_init = ktdp.load %mean_tile : !ktdp.access_tile<4xindex> -> tensor<4xf16>
+
+    %msq_tile = ktdp.construct_access_tile %msq_view[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>,
+      access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<4xf16> -> !ktdp.access_tile<4xindex>
+
+    %msq_init = ktdp.load %msq_tile : !ktdp.access_tile<4xindex> -> tensor<4xf16>
+
+    %mean, %msq = linalg.generic {
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                         affine_map<(d0, d1) -> (d0)>,
+                         affine_map<(d0, d1) -> (d0)>],
+        iterator_types = ["parallel", "reduction"]}
+        ins(%x : tensor<4x8xf16>)
+        outs(%mean_init, %msq_init : tensor<4xf16>, tensor<4xf16>) {
+      ^bb0(%in : f16, %acc0 : f16, %acc1 : f16):
+        %m, %s = spyreop.exx2 %in : f16
+        linalg.yield %m, %s : f16, f16
+    } -> tensor<4xf16>, tensor<4xf16>
+
+    ktdp.store %mean, %mean_tile : tensor<4xf16>, !ktdp.access_tile<4xindex>
+    ktdp.store %msq, %msq_tile : tensor<4xf16>, !ktdp.access_tile<4xindex>
+
+    return
+  }
+}
+"""
+
+
+def test_exx2_via_real_interpreter():
+    interp = KTIRInterpreter()
+    interp.load(_EXX2_MLIR)
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((4, 8)).astype(np.float32).astype(np.float16)
+    mean_buf = np.zeros((4,), dtype=np.float16)
+    msq_buf = np.zeros((4,), dtype=np.float16)
+
+    outputs = interp.execute_function(
+        "exx2_kernel", x_ptr=x, mean_ptr=mean_buf, msq_ptr=msq_buf,
+    )
+
+    x_f32 = x.astype(np.float32)
+    expected_mean = x_f32.mean(axis=1)
+    expected_msq = (x_f32 ** 2).mean(axis=1)
+    assert np.allclose(outputs["mean_ptr"], expected_mean, rtol=1e-2, atol=1e-2)
+    assert np.allclose(outputs["msq_ptr"], expected_msq, rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
 # Defensive _YieldResult tracking in execute_region
 # ---------------------------------------------------------------------------
 

@@ -99,6 +99,27 @@ def _binop_via_op(op, context, fn):
     return fn(a, b)
 
 
+def get_linalg_context_var(context, name, op_name):
+    """Fetch a ``__linalg_*__`` hidden context var set by ``linalg.generic``.
+
+    ``linalg.index`` (``__linalg_shape__``) and ``spyreop.exx2``
+    (``__linalg_reduction_dims__``) both read a value stashed into context
+    by the enclosing ``linalg.generic`` rather than carried in their own
+    operands/attributes -- see ``linalg__generic`` in ``linalg_ops.py``.
+    Used outside that context (no enclosing ``linalg.generic``), the raw
+    ``context.get_value`` lookup raises a bare ``KeyError`` naming the
+    internal variable; this wraps that into a message naming *op_name*
+    and the actual requirement instead.
+    """
+    try:
+        return context.get_value(name)
+    except KeyError:
+        raise ValueError(
+            f"{op_name}: must be used inside a linalg.generic reduction "
+            f"body (missing context var {name!r})"
+        ) from None
+
+
 def unwrap_yield(result):
     """Unwrap a _YieldResult sentinel produced by scf.yield / linalg.yield.
 

@@ -23,8 +23,18 @@ from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
 from ..parser_ast import parse_affine_map
 from ..parser_utils import find_ssa_names, parse_attr_list
-from ._helpers import unwrap_yield
+from ._helpers import get_linalg_context_var, unwrap_yield
 from .registry import register, register_parser
+
+
+# Ops whose own semantics already perform a reduction over the full
+# iteration shape (see ``_whole_body_reduce``'s docstring) -- the only
+# bodies allowed to skip the classic accumulator-combiner path entirely.
+# A body that never reads its outs but also doesn't call one of these is
+# not a reduction the "whole-body" path understands; it falls through to
+# the combiner path below, which raises its usual "cannot identify
+# combiner op" error instead of silently returning unreduced data.
+_SELF_REDUCING_OPS = frozenset({"spyreop.exx2"})
 
 
 def _resolve_region_body(op):
@@ -566,11 +576,15 @@ def linalg__generic(op, context, env):
       updates its outs block arg) — unchanged from before, still the only
       shape with more than one outs operand's worth of fold logic;
     - a "whole-body" reduction whose body never references ANY outs block
-      arg at all — e.g. ``spyreop.exx2``'s ``(mean, squares)`` pair, which
-      is applied once per un-reduced row, not folded pairwise over one
-      (see :func:`_whole_body_reduce`). This shape is what makes N>1 outs
+      arg at all AND calls one of ``_SELF_REDUCING_OPS`` (e.g.
+      ``spyreop.exx2``'s ``(mean, squares)`` pair, which is applied once
+      per un-reduced row, not folded pairwise over one — see
+      :func:`_whole_body_reduce`). This shape is what makes N>1 outs
       meaningful here; the classic combiner path stays single-output,
-      since nothing in scope needs an N-accumulator pairwise fold.
+      since nothing in scope needs an N-accumulator pairwise fold. A body
+      that doesn't read its outs but also isn't one of these intrinsics
+      falls through to the combiner path, which raises its usual
+      diagnostic rather than silently returning unreduced data.
     """
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
@@ -650,8 +664,9 @@ def linalg__generic(op, context, env):
         o.op_type != "linalg.yield" and any(name in o.operands for name in outs_bb0_names if name)
         for o in body_ops
     )
+    body_has_self_reducing_op = any(o.op_type in _SELF_REDUCING_OPS for o in body_ops)
 
-    if not body_reads_an_outs:
+    if not body_reads_an_outs and body_has_self_reducing_op:
         results = _whole_body_reduce(
             body_ops, outs_vals, iter_shape, out_shape, out_np_dtype,
             reduction_dims, indexing_maps[n_ins:n_ins + n_outs], context, env,
@@ -776,7 +791,7 @@ def _whole_body_reduce(
 def linalg__index(op, context, env):
     """Return a broadcasting index array for the given iteration dimension."""
     dim = op.attributes.get("dim", 0)
-    out_shape = context.get_value("__linalg_shape__")
+    out_shape = get_linalg_context_var(context, "__linalg_shape__", "linalg.index")
     idx = np.arange(out_shape[dim], dtype=np.int64)
     reshape = [1] * len(out_shape)
     reshape[dim] = out_shape[dim]

@@ -39,7 +39,7 @@ below).
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.spyreop_ops import SpyreOps
-from ._helpers import _unary
+from ._helpers import _unary, get_linalg_context_var
 from .registry import register, register_parser
 
 
@@ -134,10 +134,17 @@ def parse_spyreop_softplus(op_text, parse_ctx):
     if not op_text.startswith("spyreop.softplus"):
         return None
 
-    operands = find_ssa_names(op_text[len("spyreop.softplus"):].split("beta")[0])
     beta_match = re.search(r'\bbeta\s+([^\s]+)', op_text)
     threshold_match = re.search(r'\bthreshold\s+([^\s]+)', op_text)
-    if not operands or not beta_match or not threshold_match:
+    if not beta_match or not threshold_match:
+        raise ValueError(f"spyreop.softplus: malformed operation text: {op_text!r}")
+
+    # Slice off everything from the `beta` keyword onward using the same
+    # word-boundary-anchored match used above, rather than a plain string
+    # split on "beta" -- that would also cut inside any SSA name merely
+    # containing "beta" as a substring (e.g. %x_beta, %beta_in).
+    operands = find_ssa_names(op_text[len("spyreop.softplus"):beta_match.start()])
+    if not operands:
         raise ValueError(f"spyreop.softplus: malformed operation text: {op_text!r}")
 
     result_type = None
@@ -202,7 +209,9 @@ def spyreop__exx2(op, context, env):
     generic's ``iterator_types``, not into ``spyreop.exx2`` itself).
     """
     val = context.get_value(op.operands[0])
-    reduction_dims = context.get_value("__linalg_reduction_dims__")
+    reduction_dims = get_linalg_context_var(
+        context, "__linalg_reduction_dims__", "spyreop.exx2"
+    )
     if len(reduction_dims) != 1:
         raise ValueError(
             f"spyreop.exx2: expected exactly one reduction dim, got {reduction_dims}"
